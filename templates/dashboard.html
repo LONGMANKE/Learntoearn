@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Dashboard | Learn-to-Earn</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet"/>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" defer></script>
+  <style>
+    body {
+      background-color: #0f172a;
+      color: #f8fafc;
+      overflow-x: hidden;
+    }
+
+    .sidebar {
+      background-color: #1e293b;
+      height: 100vh;
+      padding: 1rem;
+      width: 250px;
+      transition: width 0.3s ease;
+      overflow-x: hidden;
+    }
+
+    .sidebar.collapsed {
+      width: 70px;
+    }
+
+    .sidebar h6, .sidebar p, .sidebar a {
+      transition: opacity 0.3s ease;
+    }
+
+    .sidebar.collapsed h6,
+    .sidebar.collapsed p,
+    .sidebar.collapsed a {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .icon-only {
+      font-size: 1.5rem;
+      display: block;
+      opacity: 1;
+    }
+
+    .navbar {
+      position: sticky;
+      top: 0;
+      z-index: 1001;
+      background-color: #1e293b;
+    }
+
+    .planner-card {
+      background-color: #1e293b;
+      padding: 1rem;
+      border-radius: 0.5rem;
+      margin-bottom: 1rem;
+      color: #e2e8f0;
+    }
+
+    .chat-box {
+      position: fixed;
+      bottom: 0;
+      width: 100%;
+      background-color: transparent;
+      padding: 1rem;
+      z-index: 1050;
+    }
+
+    .chat-box form {
+      display: flex;
+      gap: 10px;
+      width: 80%;
+      max-width: 800px;
+      margin: auto;
+      background-color: #1e293b;
+      border-radius: 999px;
+      padding: 0.5rem 1rem;
+      box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.2);
+    }
+
+    .chat-box input[type="text"] {
+      flex-grow: 1;
+      border: none;
+      background: transparent;
+      color: #f8fafc;
+    }
+
+    .chat-box input:focus {
+      outline: none;
+      box-shadow: none;
+    }
+
+    .avatar {
+      border-radius: 50%;
+      width: 32px;
+      height: 32px;
+    }
+
+    #toggleSidebarBtn {
+      background: none;
+      border: none;
+      color: #facc15;
+      font-size: 1.5rem;
+      cursor: pointer;
+    }
+
+    .dropdown-menu {
+      background-color: #1e293b;
+      border: none;
+    }
+
+    .dropdown-item:hover {
+      background-color: #334155;
+    }
+  </style>
+</head>
+<body>
+  <!-- Navbar -->
+  <nav class="navbar d-flex justify-content-between align-items-center px-3 py-2">
+    <div class="d-flex align-items-center gap-3">
+      <button id="toggleSidebarBtn" class="btn btn-sm text-warning fs-3">☰</button>
+      <div>
+        <h5 class="mb-0 text-white">🎓 Learn-to-Earn Pathway Agent</h5>
+        <small class="text-light">Ask the AI what career path you'd like to explore.</small>
+      </div>
+    </div>
+    <div class="dropdown">
+      <button class="btn btn-dark dropdown-toggle d-flex align-items-center gap-2" type="button" id="profileDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+        <img src="https://ui-avatars.com/api/?name={{ username }}&background=random&color=fff&size=32" class="avatar" alt="Avatar" />
+      </button>
+      <ul class="dropdown-menu dropdown-menu-end text-light" aria-labelledby="profileDropdown">
+        <li><h6 class="dropdown-header text-light">👤 {{ username }}</h6></li>
+        <li><hr class="dropdown-divider" /></li>
+        <li><a class="dropdown-item text-danger" href="{{ url_for('logout') }}">🚪 Logout</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Main Layout -->
+  <div class="container-fluid">
+    <div class="row">
+      <!-- Sidebar -->
+      <div class="col-auto sidebar" id="sidebar">
+        <div class="text-light mb-3 d-flex align-items-center">
+          <span class="me-2 icon-only">💬</span>
+          <h6 class="mb-0">Chat History</h6>
+        </div>
+        {% for date, chats in grouped_chats.items() %}
+          <p class="text-secondary icon-only">📅</p>
+          <p class="text-secondary">{{ date }}</p>
+          {% for chat in chats %}
+            <p>
+              <a href="/dashboard?chat_id={{ chat.id }}" class="text-light">📝 {{ chat.summary }}</a>
+            </p>
+          {% endfor %}
+        {% endfor %}
+      </div>
+
+      <!-- Main Content -->
+      <div class="col p-4" id="main-content">
+        {% if message %}
+          <div class="alert alert-info">{{ message }}</div>
+        {% endif %}
+
+        {% if selected_chat %}
+          <div class="mt-4">
+            <div class="mb-2">
+              <div class="bg-dark text-white p-3 rounded-4 shadow-sm" style="max-width: 90%; margin-left: auto;">
+                <strong>You:</strong><br>{{ selected_chat[0] }}
+              </div>
+            </div>
+            <div class="mb-2">
+              <div class="bg-info text-white p-3 rounded-4 shadow-sm" style="max-width: 90%; margin-right: auto; background-color: #0f766e !important;">
+                <strong>Agent:</strong><br>{{ selected_chat[1] }}
+              </div>
+            </div>
+          </div>
+        {% endif %}
+
+        <h4 class="mt-5">📒 Your Learning Planner</h4>
+        {% for item in roadmap %}
+          {% set level_info = None %}
+          {% for lvl in progress %}
+            {% if lvl[0] == item['level'] %}
+              {% set level_info = lvl %}
+            {% endif %}
+          {% endfor %}
+          <div class="planner-card">
+            <h5>{{ item.level }} | Status: {{ level_info[1].capitalize() if level_info else 'N/A' }}</h5>
+            <p><strong>⏳ Duration:</strong> {{ item.duration }}</p>
+            <p><strong>📚 Topics:</strong></p>
+            <ul>{% for topic in item.topics %}<li>{{ topic }}</li>{% endfor %}</ul>
+            <p><strong>💻 Project:</strong> {{ item.project }}</p>
+            <p><strong>🔗 Resources:</strong></p>
+            <ul>{% for res in item.resources %}<li><a href="{{ res }}" target="_blank">{{ res }}</a></li>{% endfor %}</ul>
+          </div>
+        {% endfor %}
+
+        <h4 class="mt-5">🎯 Internship & Gig Suggestions</h4>
+        <p>We'll match you with real opportunities based on your progress soon!</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chat Box -->
+  <div class="chat-box d-flex justify-content-center">
+    <form method="POST">
+      <input type="text" name="career_query" class="form-control border-0 bg-transparent text-light" placeholder="Ask me what you want to become..." />
+      <button name="generate" value="1" class="btn btn-primary rounded-pill px-4">Send</button>
+    </form>
+  </div>
+
+  <!-- Sidebar Toggle Script -->
+  <script>
+    const toggleBtn = document.getElementById('toggleSidebarBtn');
+    const sidebar = document.getElementById('sidebar');
+    toggleBtn.addEventListener('click', () => {
+      sidebar.classList.toggle('collapsed');
+    });
+  </script>
+</body>
+</html>

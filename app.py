@@ -1,214 +1,222 @@
-# Learn-to-Earn Pathway Agent with Login, Planner & Dynamic Roadmap Tracking
-
 import os
-import sqlite3
-import streamlit as st
-from dotenv import load_dotenv
-import openai
 import json
 import re
+import sqlite3
 from datetime import datetime, timedelta
+from collections import defaultdict
 
-# Load environment variables
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask_bcrypt import Bcrypt
+from dotenv import load_dotenv
+import openai
+from langchain.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+
+# --- Config ---
 load_dotenv()
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "super-secret")
+bcrypt = Bcrypt(app)
 openai.api_key = os.getenv("OPENAI_API_KEY")
+DB_PATH = "user_progress.db"
+CHROMA_DIR = "chroma_db"
 
-# Initialize SQLite database
-conn = sqlite3.connect("user_progress.db", check_same_thread=False)
-c = conn.cursor()
+# --- Embeddings and Vectorstore Setup ---
+embedding = OpenAIEmbeddings()
+vectorstore = Chroma(embedding_function=embedding, persist_directory=CHROMA_DIR)
 
-# Tables
-c.execute('''CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    career_choice TEXT,
-    current_step TEXT
-)''')
-c.execute('''CREATE TABLE IF NOT EXISTS roadmap_progress (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT,
-    career TEXT,
-    level TEXT,
-    status TEXT,
-    start_date DATE,
-    end_date DATE
-)''')
-c.execute('''CREATE TABLE IF NOT EXISTS chats (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT,
-    message TEXT,
-    response TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)''')
-conn.commit()
+# --- DB Helper ---
+def get_db():
+    return sqlite3.connect(DB_PATH)
 
-# --- Streamlit Setup ---
-st.set_page_config(page_title="Learn-to-Earn Pathway Agent")
-st.title("🎓 Learn-to-Earn Pathway Agent")
+# --- Get or Generate Roadmap ---
+def get_or_generate_roadmap(username, career):
+    conn = get_db()
+    c = conn.cursor()
 
-# --- Login ---
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "username" not in st.session_state:
-    st.session_state.username = ""
+    docs = vectorstore.similarity_search(career, k=1)
+    if docs:
+        roadmap_text = docs[0].page_content
+        source = "cache"
+    else:
+        prompt = f"""
+        Create a personalized learning roadmap for someone who wants to become a {career}.
+        Break it down into Beginner, Intermediate, and Advanced.
+        For each level, return:
+        {{
+            "level": "Beginner",
+            "duration": "2 weeks",
+            "topics": ["HTML", "CSS", "JavaScript"],
+            "project": "Build a personal blog",
+            "resources": ["https://codecademy.com", "https://w3schools.com"]
+        }}
+        Format the result as a JSON array. No commentary.
+        """
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are an AI roadmap planner."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        raw = response.choices[0].message.content.strip()
 
-if not st.session_state.logged_in:
-    with st.form("login_form"):
-        username = st.text_input("Enter your username")
-        password = st.text_input("Enter your password", type="password")
-        submitted = st.form_submit_button("Login")
+        match = re.search(r"\[\s*{.*?}\s*](?=\s*[\]\}])?", raw, re.DOTALL)
+        if not match:
+            raise ValueError("AI response did not contain a valid JSON array.")
 
-        if submitted and username and password:
-            c.execute("SELECT * FROM users WHERE username = ? AND career_choice = ?", (username, password))
-            result = c.fetchone()
-            if result:
-                st.session_state.username = username
-                st.session_state.logged_in = True
-                st.success(f"Welcome back, {username}!")
-                st.rerun()
+        roadmap_json = json.loads(match.group(0))
+        roadmap_text = json.dumps(roadmap_json, indent=2)
+
+        c.execute("INSERT INTO chats (username, message, response) VALUES (?, ?, ?)",
+                  (username, prompt, roadmap_text))
+        conn.commit()
+
+        doc = Document(page_content=roadmap_text, metadata={"career": career})
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks = splitter.split_documents([doc])
+        vectorstore.add_documents(chunks)
+        vectorstore.persist()
+        source = "openai"
+
+    conn.close()
+    return roadmap_json, source
+
+# --- Routes ---
+@app.route("/", methods=["GET", "POST"])
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if 'username' in session:
+        return redirect(url_for("dashboard"))
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT,
+        career_choice TEXT,
+        current_step TEXT
+    )""")
+
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        mode = request.form.get("mode")
+
+        if username and password:
+            if mode == "Login":
+                c.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, password))
+                user = c.fetchone()
+                if user:
+                    session["username"] = username
+                    flash("Logged in successfully", "info")
+                    return redirect(url_for("dashboard"))
+                else:
+                    flash("Invalid credentials", "danger")
             else:
-                st.error("Invalid username or password.")
-        elif submitted:
-            st.error("Please enter both username and password.")
-
-    with st.expander("Don't have an account? Create one"):
-        new_username = st.text_input("New Username", key="signup_user")
-        new_password = st.text_input("New Password", type="password", key="signup_pass")
-        if st.button("Sign Up"):
-            if new_username and new_password:
                 try:
-                    c.execute("INSERT INTO users (username, career_choice, current_step) VALUES (?, ?, ?)",
-                              (new_username, new_password, "Getting Started"))
+                    c.execute("INSERT INTO users (username, password, career_choice, current_step) VALUES (?, ?, ?, ?)",
+                              (username, password, '', 'Getting Started'))
                     conn.commit()
-                    st.success("Account created! Please log in.")
+                    flash("Account created! Please log in.", "success")
+                    return redirect(url_for("login"))
                 except sqlite3.IntegrityError:
-                    st.warning("Username already exists.")
-            else:
-                st.error("Please enter both username and password.")
-    st.stop()
+                    flash("Username already exists", "warning")
+        else:
+            flash("Please enter both fields", "warning")
 
-username = st.session_state.username
-st.sidebar.write(f"👋 Logged in as: {username}")
-if st.sidebar.button("Logout"):
-    st.session_state.logged_in = False
-    st.session_state.username = ""
-    st.rerun()
+    conn.close()
+    return render_template("login.html")
 
-# --- Roadmap Generation ---
-st.write("Choose a career path and let the agent guide you from learning to earning.")
-career = st.selectbox("Choose a career path:", ["Data Analyst", "Frontend Developer", "Backend Developer", "AI/ML Engineer", "DevOps Engineer"])
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
-roadmap_data = []
-if st.button("Generate Roadmap"):
-    prompt = f"""
-    Create a personalized learning roadmap for someone who wants to become a {career}.
-    Break it down into Beginner, Intermediate, and Advanced.
-    For each level, return:
-    {{
-        "level": "Beginner",
-        "duration": "2 weeks",
-        "topics": ["HTML", "CSS", "JavaScript"],
-        "project": "Build a personal blog",
-        "resources": ["https://codecademy.com", "https://w3schools.com"]
-    }}
-    Format the result as a JSON array. No commentary.
-    """
+@app.route("/dashboard", methods=['GET', 'POST'])
+def dashboard():
+    if 'username' not in session:
+        return redirect(url_for('login'))
 
-    with st.spinner("Generating roadmap from OpenAI..."):
+    username = session['username']
+    message = None
+    roadmap = []
+    selected_chat = None
+    chat_entries = []
+    career = request.form.get('career_query', 'Data Analyst')
+
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute("""CREATE TABLE IF NOT EXISTS roadmap_progress (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        career TEXT,
+        level TEXT,
+        status TEXT,
+        start_date DATE,
+        end_date DATE
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS chats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        message TEXT,
+        response TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    if request.method == 'POST' and 'generate' in request.form:
         try:
-            response = openai.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are an AI roadmap planner."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            raw = response.choices[0].message.content.strip()
-
-            json_text = re.search(r"\[.*\]", raw, re.DOTALL).group()
-            roadmap_data = json.loads(json_text)
-
-            for item in roadmap_data:
-                if not all(k in item for k in ["level", "duration", "topics", "project", "resources"]):
-                    raise ValueError("Missing expected keys in roadmap item.")
-
-            for item in roadmap_data:
+            roadmap, source = get_or_generate_roadmap(username, career)
+            for item in roadmap:
                 c.execute("""
-                INSERT INTO roadmap_progress (username, career, level, status, start_date, end_date)
-                VALUES (?, ?, ?, ?, ?, ?)""",
+                    INSERT INTO roadmap_progress (username, career, level, status, start_date, end_date)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
                           (username, career, item['level'], 'not_started', None, None))
             conn.commit()
-
-            c.execute("INSERT INTO chats (username, message, response) VALUES (?, ?, ?)",
-                      (username, f"Generate roadmap for {career}", json.dumps(roadmap_data)))
-            conn.commit()
-
-            st.success("Roadmap successfully generated and saved.")
+            message = f"Roadmap generated from {source}"
         except Exception as e:
-            st.error(f"⚠️ Failed to parse roadmap: {e}")
-            st.text_area("⚙️ Raw AI Response", raw, height=300)
+            message = f"Error: {str(e)}"
 
-# --- Planner View ---
-st.subheader("📒 Your Learning Planner")
-c.execute("SELECT level, status, start_date, end_date FROM roadmap_progress WHERE username = ? AND career = ?", (username, career))
-levels = c.fetchall()
+    c.execute("SELECT response FROM chats WHERE username = ? AND message LIKE ? ORDER BY timestamp DESC LIMIT 1",
+              (username, f"%{career}%"))
+    chat_data = c.fetchone()
+    if chat_data:
+        try:
+            roadmap = json.loads(chat_data[0])
+        except json.JSONDecodeError:
+            roadmap = []
 
-c.execute("SELECT response FROM chats WHERE username = ? AND message LIKE ? ORDER BY timestamp DESC LIMIT 1", (username, f"%{career}%"))
-chat_data = c.fetchone()
-try:
-    roadmap_response = json.loads(chat_data[0]) if chat_data and chat_data[0] else []
-except json.JSONDecodeError:
-    st.warning("⚠️ Could not decode saved roadmap. Please regenerate it.")
-    roadmap_response = []
+    c.execute("SELECT level, status, start_date, end_date FROM roadmap_progress WHERE username = ? AND career = ?",
+              (username, career))
+    progress = c.fetchall()
 
-for item in roadmap_response:
-    level_info = next((lvl for lvl in levels if lvl[0] == item["level"]), None)
-    with st.expander(f"📘 {item['level']} | Status: {level_info[1].capitalize() if level_info else 'N/A'}"):
-        st.markdown(f"**⏳ Duration:** {item['duration']}")
-        st.markdown("**📚 Topics to Learn:**")
-        for topic in item['topics']:
-            st.markdown(f"- {topic}")
-        st.markdown(f"**💻 Project:** {item['project']}")
-        st.markdown("**🔗 Resources:**")
-        for link in item['resources']:
-            st.markdown(f"- [{link}]({link})")
+    c.execute("SELECT id, message, timestamp FROM chats WHERE username = ? ORDER BY timestamp DESC", (username,))
+    chat_entries = c.fetchall()
 
-        if level_info and level_info[1] == "not_started":
-            if st.button(f"📅 Start {item['level']} Level", key=item['level']):
-                start = datetime.now().date()
-                end = start + timedelta(weeks=2)
-                c.execute("""
-                UPDATE roadmap_progress SET status = ?, start_date = ?, end_date = ?
-                WHERE username = ? AND career = ? AND level = ?""",
-                          ("in_progress", start, end, username, career, item['level']))
-                conn.commit()
-                st.success(f"Started {item['level']} level!")
-                st.rerun()
-        elif level_info and level_info[1] == "in_progress":
-            if st.button(f"✅ Mark {item['level']} Level as Completed", key=item['level']+"done"):
-                c.execute("""
-                UPDATE roadmap_progress SET status = ?, end_date = ?
-                WHERE username = ? AND career = ? AND level = ?""",
-                          ("completed", datetime.now().date(), username, career, item['level']))
-                conn.commit()
-                st.success(f"Marked {item['level']} as completed!")
-                st.rerun()
+    selected = request.args.get('chat_id')
+    if selected:
+        c.execute("SELECT message, response FROM chats WHERE id = ?", (selected,))
+        selected_chat = c.fetchone()
 
-# --- Chat History ---
-st.sidebar.subheader("💬 Chat History")
-c.execute("SELECT id, message, timestamp FROM chats WHERE username = ? ORDER BY timestamp DESC", (username,))
-chat_entries = c.fetchall()
-selected_chat_id = st.sidebar.selectbox("Select a past chat to view:", ["-- Select --"] + [f"{entry[2]} - {entry[1][:30]}..." for entry in chat_entries])
-if selected_chat_id != "-- Select --":
-    index = [f"{entry[2]} - {entry[1][:30]}..." for entry in chat_entries].index(selected_chat_id)
-    chat_id = chat_entries[index][0]
-    c.execute("SELECT message, response FROM chats WHERE id = ?", (chat_id,))
-    chat = c.fetchone()
-    if chat:
-        st.subheader("💬 Selected Chat")
-        st.markdown(f"**You:** {chat[0]}")
-        st.markdown(f"**Agent:** {chat[1]}")
+    grouped_chats = defaultdict(list)
+    for chat_id, message, timestamp in chat_entries:
+        date_key = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%B %d, %Y")
+        grouped_chats[date_key].append({
+            "id": chat_id,
+            "summary": message[:30] + "...",
+            "timestamp": timestamp
+        })
 
-# --- Internship Suggestions Placeholder ---
-st.subheader("🎯 Internship & Gig Suggestions")
-st.write("We'll match you with real opportunities based on your progress soon!")
+    conn.close()
+    return render_template('dashboard.html', username=username, message=message,
+                           roadmap=roadmap, progress=progress,
+                           career=career, chat_entries=chat_entries,
+                           selected_chat=selected_chat, grouped_chats=grouped_chats)
+
+if __name__ == '__main__':
+    app.run(debug=True)
